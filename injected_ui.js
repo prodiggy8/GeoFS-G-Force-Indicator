@@ -48,9 +48,23 @@
         position: 'fixed', top: '0', left: '0', width: '100%', height: '100%',
         pointerEvents: 'none', zIndex: '2147483640',
         background: 'radial-gradient(ellipse at center, transparent 50%, rgba(0,0,0,0.95) 100%)',
-        opacity: '0', transition: 'opacity 0.2s ease-out'
+        opacity: '0', transition: 'opacity 0.15s ease-out',
+        backdropFilter: 'blur(0px)', webkitBackdropFilter: 'blur(0px)', willChange: 'opacity, backdrop-filter'
     });
     document.body.appendChild(blackoutLayer);
+
+    // --- 3b. Create G-LOC banner (shown when pilot blacks out) ---
+    const locBanner = document.createElement('div');
+    locBanner.id = 'g-loc-banner';
+    locBanner.innerText = 'G-LOC';
+    Object.assign(locBanner.style, {
+        position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
+        pointerEvents: 'none', zIndex: '2147483641', opacity: '0',
+        color: '#ff2b2b', fontFamily: '"Courier New", Consolas, monospace', fontWeight: 'bold',
+        fontSize: '42px', letterSpacing: '8px', textShadow: '0 0 20px rgba(255,0,0,0.8)',
+        transition: 'opacity 0.3s ease-out'
+    });
+    document.body.appendChild(locBanner);
 
     // --- 4. Create HUD Container ---
     const container = document.createElement('div');
@@ -210,8 +224,43 @@
     if (blackoutToggle) {
         blackoutToggle.addEventListener('change', function() {
             maxRecord = 1.0; minRecord = 1.0;
+            gStress = 0; isLockedOut = false;
         });
     }
+
+    // --- 8b. G-LOC PHYSIOLOGY MODEL ---
+    // gStress accumulates while G is out of the safe envelope (faster the more
+    // intense it is) and recovers when G returns to normal. This punishes BOTH
+    // brief extreme spikes AND prolonged moderate-high loading.
+    const G_POS_SAFE = 4.5;   // start straining above this many +G
+    const G_NEG_SAFE = -1.5;  // start straining below this many -G (redout)
+    const G_POS_FULL = 8.0;   // overload saturates here (instant-ish blackout)
+    const G_NEG_FULL = -4.0;  // overload saturates here (instant-ish redout)
+    const STRESS_RATE   = 0.9;   // how fast stress builds at full overload (per sec)
+    const RECOVERY_RATE = 0.45;  // how fast it drains when safe (per sec)
+    const LOCK_ON  = 0.98;   // pass out at/above this
+    const LOCK_OFF = 0.45;   // regain control once recovered below this (hysteresis)
+
+    let gStress = 0;
+    let isLockedOut = false;
+    let stressIsRed = false; // tracks whether current strain is from -G (redout)
+    let lastFrameTime = performance.now();
+
+    // --- 8c. CONTROL LOCK ---
+    // While blacked out the pilot can't act. We swallow keydowns in the capture
+    // phase so GeoFS never sees new control inputs. keyup is deliberately left
+    // alone so any key held at blackout still releases/re-centers on the way out,
+    // which lets G fall and recovery actually happen (no permanent soft-lock).
+    function swallowInput(e) {
+        if (!isLockedOut) return;
+        e.stopImmediatePropagation();
+        e.preventDefault();
+    }
+    window.addEventListener('keydown', swallowInput, true);
+    window.addEventListener('keypress', swallowInput, true);
+    // Block mouse-yoke / click controls on the sim canvas too.
+    window.addEventListener('mousedown', swallowInput, true);
+    window.addEventListener('wheel', swallowInput, { capture: true, passive: false });
 
     function gameLoop() {
         if (typeof geofs === 'undefined' || !geofs.animation || !geofs.animation.values) {
@@ -234,25 +283,60 @@
         else if (simValues.accZ !== undefined) currentG = simValues.accZ / 9.81;
         currentG = parseFloat(currentG);
 
-        // Blackout
-        if (blackoutToggle && blackoutToggle.checked) {
-            if (currentG > 9.0) {
-                let intensity = (currentG - 9.0) / 6.0; 
-                if (intensity > 1.0) intensity = 1.0; 
-                blackoutLayer.style.opacity = intensity;
-                const visionRadius = 80 - (60 * intensity); 
-                blackoutLayer.style.background = `radial-gradient(ellipse at center, transparent ${visionRadius}%, rgba(0,0,0,0.95) 100%)`;
-            } else if (currentG < -3.0) {
-                let intensity = Math.abs(currentG + 3.0) / 3.0;
-                if (intensity > 1.0) intensity = 1.0;
-                blackoutLayer.style.opacity = intensity;
-                const visionRadius = 80 - (60 * intensity);
-                blackoutLayer.style.background = `radial-gradient(ellipse at center, transparent ${visionRadius}%, rgba(200,0,0,0.6) 100%)`;
-            } else {
-                blackoutLayer.style.opacity = '0';
-            }
+        // --- Time step (clamped so tab-switch pauses don't dump huge stress) ---
+        const now = performance.now();
+        let dt = (now - lastFrameTime) / 1000;
+        lastFrameTime = now;
+        if (dt > 0.1) dt = 0.1;
+
+        // --- Update G-stress accumulator ---
+        // overload is 0 inside the safe envelope, ramps to 1 at the "full" limit,
+        // and keeps growing past it so extreme spikes build stress very fast.
+        let overload = 0;
+        if (currentG > G_POS_SAFE) {
+            overload = (currentG - G_POS_SAFE) / (G_POS_FULL - G_POS_SAFE);
+            stressIsRed = false;
+        } else if (currentG < G_NEG_SAFE) {
+            overload = (G_NEG_SAFE - currentG) / (G_NEG_SAFE - G_NEG_FULL);
+            stressIsRed = true;
+        }
+
+        if (overload > 0) {
+            gStress += overload * STRESS_RATE * dt;
+        } else {
+            gStress -= RECOVERY_RATE * dt;
+        }
+        if (gStress < 0) gStress = 0;
+        if (gStress > 1) gStress = 1;
+
+        // Hysteresis: black out at LOCK_ON, only wake up once recovered to LOCK_OFF.
+        if (gStress >= LOCK_ON) isLockedOut = true;
+        else if (gStress <= LOCK_OFF) isLockedOut = false;
+
+        // --- Render the visual penalty ---
+        if (blackoutToggle && blackoutToggle.checked && gStress > 0.01) {
+            // When fully passed out, force a total blackout regardless of the curve.
+            const intensity = isLockedOut ? 1.0 : gStress;
+            blackoutLayer.style.opacity = intensity;
+
+            // Tunnel vision closes in + the whole view blurs harder as stress rises.
+            const visionRadius = 85 - (75 * intensity);
+            const blurPx = (12 * intensity).toFixed(1);
+            const tint = stressIsRed ? 'rgba(140,0,0,0.85)' : 'rgba(0,0,0,0.97)';
+            blackoutLayer.style.background =
+                `radial-gradient(ellipse at center, transparent ${visionRadius}%, ${tint} 100%)`;
+            blackoutLayer.style.backdropFilter = `blur(${blurPx}px)`;
+            blackoutLayer.style.webkitBackdropFilter = `blur(${blurPx}px)`;
+
+            locBanner.style.opacity = isLockedOut ? '1' : '0';
+            locBanner.style.color = stressIsRed ? '#ff7b4b' : '#ff2b2b';
+            locBanner.innerText = stressIsRed ? 'RED-OUT' : 'G-LOC';
         } else {
             blackoutLayer.style.opacity = '0';
+            blackoutLayer.style.backdropFilter = 'blur(0px)';
+            blackoutLayer.style.webkitBackdropFilter = 'blur(0px)';
+            locBanner.style.opacity = '0';
+            if (!(blackoutToggle && blackoutToggle.checked)) isLockedOut = false;
         }
 
         // Stats
